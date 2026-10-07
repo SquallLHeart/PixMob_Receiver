@@ -1,371 +1,379 @@
-#include "wled.h"
-
+#pragma once
 /*
- * Usermods allow you to add own functionality to WLED without touching core source files.
- * See the WLED docs: https://kno.wled.ge/advanced/custom-features/
+ * PixMob NOVA Event Receiver for WLED / ESP32-C3
  *
- * This is an example usermod. It demonstrates:
- *   - persistent settings via addToConfig() / readFromConfig()
- *   - JSON state read/write via addToJsonState() / readFromJsonState()
- *   - MQTT subscribe and message handling (guarded by WLED_DISABLE_MQTT)
- *   - button event handling
- *   - the Usermod Settings page via appendConfigData()
+ * Default hardware:
+ *   38 kHz demodulator OUT -> GPIO4
  *
- * To create your own usermod:
- *   1. Click "Use this template" on https://github.com/wled/wled-usermod-example to create your own repo.
- *   2. Rename the class and file to something descriptive.
- *   3. Reference your new repo in platformio_override.ini via custom_usermods.
+ * The ISR captures only edge timing into a fixed ring buffer.
+ * It never drives LEDs, prints serial data, allocates memory, or delays.
  *
- * REGISTER_USERMOD() at the bottom self-registers the instance — no other
- * file edits are needed.
+ * This is intentionally a documented-protocol compatibility receiver.
+ * It targets NOVA FRENCH VANILLA v3.1 / firmware 0x05.
  */
 
-//class name. Use something descriptive and leave the ": public Usermod" part :)
-class MyExampleUsermod : public Usermod {
+#include "wled.h"
+#include "PixMobNOVAProtocol.h"
 
-  private:
+class PixMobNovaEventReceiver : public Usermod {
+private:
+  static constexpr uint8_t DEFAULT_IR_PIN=4;
+  static constexpr uint32_t DEFAULT_TIMEOUT_MS=10000;
+  static constexpr size_t EDGE_RING=256;
+  static constexpr size_t MAX_BITS=256;
 
-    // Private class members. You can declare variables and functions only accessible to your usermod here
-    bool enabled = false;
-    bool initDone = false;
-    unsigned long lastTime = 0;
+  struct Edge { uint32_t dt; uint8_t level; };
+  Edge ring[EDGE_RING];
 
-    // config variables — boot defaults can be set here or inside readFromConfig()
-    bool testBool = false;
-    unsigned long testULong = 42424242;
-    float testFloat = 42.42;
-    String testString = "Forty-Two";
-    uint16_t greatValue = 0;  // example persistent value exposed in JSON state
+  volatile uint16_t head=0, tail=0;
+  volatile uint32_t lastEdgeUs=0;
+  volatile bool overflow=false;
 
-    // These config variables have defaults set inside readFromConfig()
-    int testInt;
-    long testLong;
-    int8_t testPins[2];
+  uint8_t irPin=DEFAULT_IR_PIN;
+  uint32_t timeoutMs=DEFAULT_TIMEOUT_MS;
+  uint32_t lastPacketMs=0;
+  bool active=false, initialized=false, enabled=true;
 
-    // string that are used multiple time (this will save some flash memory)
-    static const char _name[];
-    static const char _enabled[];
+  enum Mode:uint8_t { AUTO=0,NOVA=1,WLED=2 };
+  Mode mode=AUTO;
 
+  uint8_t groupIds[8]{};
+  uint8_t groupSel=0;
+  uint8_t repeatCount=0;
+  uint16_t repeatDelayMs=0;
+  uint16_t gstMs=64;
 
-    // any private methods should go here (non-inline method should be defined out of class)
-    void publishMqtt(const char* state, bool retain = false); // example for publishing MQTT message
+  uint8_t bits[MAX_BITS]{};
+  size_t bitCount=0;
 
+  struct Effect {
+    PixMobNOVA::RGB a{},b{};
+    uint32_t startMs=0;
+    uint16_t attack=0,sustain=0,release=0,delay=0;
+    uint16_t repeats=0;
+    bool two=false,running=false;
+  } effect;
 
-  public:
+  static PixMobNovaEventReceiver *self;
 
-    // non WLED related methods, may be used for data exchange between usermods (non-inline methods should be defined out of class)
+  static void IRAM_ATTR isr() {
+    if(!self) return;
+    uint32_t now=micros();
+    uint32_t dt=now-self->lastEdgeUs;
+    self->lastEdgeUs=now;
 
-    /**
-     * Enable/Disable the usermod
-     */
-    inline void enable(bool enable) { enabled = enable; }
+    uint16_t next=uint16_t((self->head+1)%EDGE_RING);
+    if(next==self->tail) { self->overflow=true; return; }
 
-    /**
-     * Get usermod enabled/disabled state
-     */
-    inline bool isEnabled() { return enabled; }
+    self->ring[self->head].dt=dt;
+    self->ring[self->head].level=(uint8_t)gpio_get_level((gpio_num_t)self->irPin);
+    self->head=next;
+  }
 
-    // To access this usermod from another usermod, cast the result of UsermodManager::lookup():
-    //   MyExampleUsermod* um = (MyExampleUsermod*) UsermodManager::lookup(USERMOD_ID_MYUSERMOD);
-    // Make sure to assign a unique ID in getId()!
+  bool pop(Edge &e) {
+    noInterrupts();
+    if(tail==head) { interrupts(); return false; }
+    e=ring[tail];
+    tail=uint16_t((tail+1)%EDGE_RING);
+    interrupts();
+    return true;
+  }
 
+  void appendRun(uint32_t us,uint8_t level) {
+    if(us<250) return;
+    float cells=float(us)/float(PixMobNOVA::SYMBOL_US);
+    int n=int(lroundf(cells));
+    if(n<1 || n>16) return;
+    if(fabsf(cells-float(n))>0.45f) return;
 
-    /*
-     * setup() is called once at boot. WiFi is not yet connected at this point.
-     * readFromConfig() is called prior to setup()
-     * You can use it to initialize variables, sensors or similar.
-     */
-    void setup() override {
-      // do your set-up here
-      //Serial.println("Hello from my usermod!");
-      initDone = true;
-    }
+    // Standard demodulator: LOW=mark=logical 1, HIGH=logical 0.
+    uint8_t bit=level ? 0 : 1;
+    while(n-- && bitCount<MAX_BITS) bits[bitCount++]=bit;
+  }
 
+  void resetFrame() { bitCount=0; }
 
-    /*
-     * connected() is called every time the WiFi is (re)connected
-     * Use it to initialize network interfaces
-     */
-    void connected() override {
-      //Serial.println("Connected to WiFi!");
-    }
+  void decodeFrame() {
+    if(bitCount<48) return;
+    PixMobNOVA::Packet p;
+    if(!PixMobNOVA::decode(bits,bitCount,p)) return;
 
+    lastPacketMs=millis();
+    if(mode==AUTO) active=true;
 
-    /*
-     * loop() is called continuously. Here you can check for events, read sensors, etc.
-     * 
-     * Tips:
-     * 1. You can use "if (WLED_CONNECTED)" to check for a successful network connection.
-     *    Additionally, "if (WLED_MQTT_CONNECTED)" is available to check for a connection to an MQTT broker.
-     * 
-     * 2. Try to avoid using the delay() function. NEVER use delays longer than 10 milliseconds.
-     *    Instead, use a timer check as shown here.
-     */
-    void loop() override {
-      // if usermod is disabled or called during strip updating just exit
-      // NOTE: on very long strips strip.isUpdating() may always return true so update accordingly
-      if (!enabled || strip.isUpdating()) return;
+    Serial.printf("[NOVA] len=%u flags=%u cmd=%u action=%u onstart=%u gsten=%u\n",
+                  p.length,p.flags,(unsigned)p.command,p.action,
+                  p.onStart,p.gsten);
+    Serial.printf("[NOVA] RGB1=%u,%u,%u\n",p.color1.r,p.color1.g,p.color1.b);
 
-      // do your magic here
-      if (millis() - lastTime > 1000) {
-        //Serial.println("I'm alive!");
-        lastTime = millis();
+    execute(p);
+  }
+
+  void consume() {
+    Edge e;
+    while(pop(e)) {
+      if(e.dt>=PixMobNOVA::FRAME_GAP_US) {
+        decodeFrame();
+        resetFrame();
+        continue;
       }
+      appendRun(e.dt,e.level);
     }
 
+    // Flush the last frame even if no subsequent packet has arrived.
+    noInterrupts();
+    uint32_t since=micros()-lastEdgeUs;
+    interrupts();
+    if(bitCount && since>=PixMobNOVA::FRAME_GAP_US) {
+      decodeFrame();
+      resetFrame();
+    }
+  }
 
-    /*
-     * addToJsonInfo() can be used to add custom entries to the /json/info part of the JSON API.
-     * Creating an "u" object allows you to add custom key/value pairs to the Info section of the WLED web UI.
-     * Below it is shown how this could be used for e.g. a light sensor
-     */
-    void addToJsonInfo(JsonObject& root) override
-    {
-      // if "u" object does not exist yet wee need to create it
-      JsonObject user = root["u"];
-      if (user.isNull()) user = root.createNestedObject("u");
+  bool groupAllowed(const PixMobNOVA::Packet &p) const {
+    if(p.command!=PixMobNOVA::CMD_SINGLE_COLOR_EXT) return true;
+    if(p.groupId==0) return true;
+    return p.groupId==groupIds[groupSel];
+  }
 
-      //this code adds "u":{"ExampleUsermod":[20," lux"]} to the info object
-      //int reading = 20;
-      //JsonArray lightArr = user.createNestedArray(FPSTR(_name))); //name
-      //lightArr.add(reading); //value
-      //lightArr.add(F(" lux")); //unit
+  uint32_t color(PixMobNOVA::RGB c) { return RGBW32(c.r,c.g,c.b,0); }
 
-      // if you are implementing a sensor usermod, you may publish sensor data
-      //JsonObject sensor = root[F("sensor")];
-      //if (sensor.isNull()) sensor = root.createNestedObject(F("sensor"));
-      //temp = sensor.createNestedArray(F("light"));
-      //temp.add(reading);
-      //temp.add(F("lux"));
+  void setMain(PixMobNOVA::RGB c) {
+    Segment &seg=strip.getSegment(strip.getMainSegmentId());
+    seg.setColor(0,color(c));
+    seg.setOption(SEG_OPTION_ON,true);
+    strip.trigger();
+  }
+
+  void startSingle(const PixMobNOVA::Packet &p) {
+    if(!groupAllowed(p)) return;
+
+    if(p.command==PixMobNOVA::CMD_SINGLE_COLOR_EXT) {
+      uint8_t chance=PixMobNOVA::chancePercent(p.chanceCode);
+      if(chance<100 && random(100)>=chance) return;
     }
 
+    effect.a=p.color1;
+    effect.b=p.color1;
+    effect.attack=(p.command==PixMobNOVA::CMD_SINGLE_COLOR_EXT)
+      ? PixMobNOVA::timeCodeMs(p.attackCode) : 0;
 
-    /*
-     * addToJsonState() adds entries to the /json/state response. Clients can read and write these.
-     * Use this to expose runtime state that should be controllable via the API.
-     * addToJsonState() is NOT called for presets — use addToConfig() for persistent values.
-     */
-    void addToJsonState(JsonObject& root) override
-    {
-      if (!initDone || !enabled) return;  // prevent crash on boot applyPreset()
+    uint16_t s=(p.command==PixMobNOVA::CMD_SINGLE_COLOR_EXT)
+      ? PixMobNOVA::timeCodeMs(p.sustainCode) : 120;
 
-      JsonObject usermod = root[FPSTR(_name)];
-      if (usermod.isNull()) usermod = root.createNestedObject(FPSTR(_name));
+    effect.sustain=(p.gsten && p.sustainCode==7) ? gstMs : s;
+    effect.release=(p.command==PixMobNOVA::CMD_SINGLE_COLOR_EXT)
+      ? PixMobNOVA::timeCodeMs(p.releaseCode) : 32;
+    effect.delay=repeatDelayMs;
+    effect.repeats=repeatCount;
+    effect.two=false;
+    effect.startMs=millis();
+    effect.running=true;
+  }
 
-      usermod["greatValue"] = greatValue;
-    }
+  void startTwo(const PixMobNOVA::Packet &p) {
+    effect.a=p.color1; effect.b=p.color2;
+    effect.attack=0; effect.sustain=250; effect.release=0;
+    effect.delay=repeatDelayMs; effect.repeats=repeatCount;
+    effect.two=true; effect.startMs=millis(); effect.running=true;
+  }
 
+  void execute(const PixMobNOVA::Packet &p) {
+    switch(p.command) {
+      case PixMobNOVA::CMD_SINGLE_COLOR:
+      case PixMobNOVA::CMD_SINGLE_COLOR_EXT: startSingle(p); break;
 
-    /*
-     * readFromJsonState() receives values a client POSTs to /json/state.
-     * The JSON key nesting matches what addToJsonState() writes — clients send back the same structure.
-     */
-    void readFromJsonState(JsonObject& root) override
-    {
-      if (!initDone) return;  // prevent crash on boot applyPreset()
+      case PixMobNOVA::CMD_TWO_COLORS: startTwo(p); break;
 
-      JsonObject usermod = root[FPSTR(_name)];
-      if (!usermod.isNull()) {
-        // getJsonValue copies the value if present and returns true; leaves the variable unchanged if missing
-        getJsonValue(usermod["greatValue"], greatValue);
-      }
-    }
+      case PixMobNOVA::CMD_SET_GROUP_SEL:
+        groupSel=p.decoded[8]&7; break;
 
-
-    /*
-     * addToConfig() saves settings to cfg.json under the "um" object. WLED calls this whenever settings are saved.
-     * The Usermod Settings page in the UI is generated automatically from the keys you write here.
-     *
-     * Usermod Settings Overview:
-     * - Numeric values are treated as floats in the browser.
-     *   - If the numeric value entered into the browser contains a decimal point, it will be parsed as a C float
-     *     before being returned to the Usermod.  The float data type has only 6-7 decimal digits of precision, and
-     *     doubles are not supported, numbers will be rounded to the nearest float value when being parsed.
-     *     The range accepted by the input field is +/- 1.175494351e-38 to +/- 3.402823466e+38.
-     *   - If the numeric value entered into the browser doesn't contain a decimal point, it will be parsed as a
-     *     C int32_t (range: -2147483648 to 2147483647) before being returned to the usermod.
-     *     Overflows or underflows are truncated to the max/min value for an int32_t, and again truncated to the type
-     *     used in the Usermod when reading the value from ArduinoJson.
-     * - Pin values can be treated differently from an integer value by using the key name "pin"
-     *   - "pin" can contain a single or array of integer values
-     *   - On the Usermod Settings page there is simple checking for pin conflicts and warnings for special pins
-     *     - Red color indicates a conflict.  Yellow color indicates a pin with a warning (e.g. an input-only pin)
-     *   - Tip: use int8_t to store the pin value in the Usermod, so a -1 value (pin not set) can be used
-     *
-     * To force a config write from loop(), call serializeConfig() — but use it sparingly (flash wear,
-     * possible LED stutter). Never call it from a network callback.
-     */
-    void addToConfig(JsonObject& root) override
-    {
-      JsonObject top = root.createNestedObject(FPSTR(_name));
-      top[FPSTR(_enabled)] = enabled;
-      top["great"] = greatValue;
-      top["testBool"] = testBool;
-      top["testInt"] = testInt;
-      top["testLong"] = testLong;
-      top["testULong"] = testULong;
-      top["testFloat"] = testFloat;
-      top["testString"] = testString;
-      JsonArray pinArray = top.createNestedArray("pin");
-      pinArray.add(testPins[0]);
-      pinArray.add(testPins[1]); 
-    }
-
-
-    /*
-     * readFromConfig() is called before setup() and again after settings are saved.
-     * Return false if any expected keys were missing — WLED will then call addToConfig() to write the defaults.
-     * getJsonValue(src, dest) copies the value if present and returns true; leaves dest unchanged if missing.
-     * getJsonValue(src, dest, default) also assigns a default when the key is absent.
-     */
-    bool readFromConfig(JsonObject& root) override
-    {
-      JsonObject top = root[FPSTR(_name)];
-
-      bool configComplete = !top.isNull();
-
-      configComplete &= getJsonValue(top["great"], greatValue);
-      configComplete &= getJsonValue(top["testBool"], testBool);
-      configComplete &= getJsonValue(top["testULong"], testULong);
-      configComplete &= getJsonValue(top["testFloat"], testFloat);
-      configComplete &= getJsonValue(top["testString"], testString);
-
-      // A 3-argument getJsonValue() assigns the 3rd argument as a default value if the Json value is missing
-      configComplete &= getJsonValue(top["testInt"], testInt, 42);  
-      configComplete &= getJsonValue(top["testLong"], testLong, -42424242);
-
-      // "pin" fields have special handling in settings page (or some_pin as well)
-      configComplete &= getJsonValue(top["pin"][0], testPins[0], -1);
-      configComplete &= getJsonValue(top["pin"][1], testPins[1], -1);
-
-      return configComplete;
-    }
-
-
-    /*
-     * appendConfigData() is called when the Usermod Settings page renders.
-     * Write JavaScript snippets to settingsScript to add helper text or dropdowns for your config fields.
-     * addInfo('<ModName>:<key>', 1, '<html>') adds a tooltip/label next to the field.
-     * addDropdown / addOption replace a plain text input with a <select>.
-     */
-    void appendConfigData(Print& settingsScript) override
-    {
-      settingsScript.print(F("addInfo('")); settingsScript.print(FPSTR(_name)); settingsScript.print(F(":great',1,'<i>(this is a great config value)</i>');"));
-      settingsScript.print(F("addInfo('")); settingsScript.print(FPSTR(_name)); settingsScript.print(F(":testString',1,'enter any string you want');"));
-      settingsScript.print(F("dd=addDropdown('")); settingsScript.print(FPSTR(_name)); settingsScript.print(F("','testInt');"));
-      settingsScript.print(F("addOption(dd,'Nothing',0);"));
-      settingsScript.print(F("addOption(dd,'Everything',42);"));
-    }
-
-
-    /*
-     * handleOverlayDraw() is called just before every show() (LED strip update frame) after effects have set the colors.
-     * Use this to blank out some LEDs or set them to a different color regardless of the set effect mode.
-     * Commonly used for custom clocks (Cronixie, 7 segment)
-     */
-    void handleOverlayDraw() override
-    {
-      //strip.setPixelColor(0, RGBW32(0,0,0,0)) // set the first pixel to black
-    }
-
-
-    /**
-     * handleButton() can be used to override default button behaviour. Returning true
-     * will prevent button working in a default way.
-     * Replicating button.cpp
-     */
-    bool handleButton(uint8_t b) override {
-      yield();
-      // ignore certain button types as they may have other consequences
-      if (!enabled
-       || buttons[b].type == BTN_TYPE_NONE
-       || buttons[b].type == BTN_TYPE_RESERVED
-       || buttons[b].type == BTN_TYPE_PIR_SENSOR
-       || buttons[b].type == BTN_TYPE_ANALOG
-       || buttons[b].type == BTN_TYPE_ANALOG_INVERTED) {
-        return false;
+      case PixMobNOVA::CMD_SET_GROUP_ID: {
+        uint8_t sel=p.decoded[5]&7;
+        groupIds[sel]=p.decoded[6]&0x1F;
+        break;
       }
 
-      bool handled = false;
-      // do your button handling here
-      return handled;
+      case PixMobNOVA::CMD_SET_REPEAT_DELAY:
+        repeatDelayMs=PixMobNOVA::timeCodeMs(p.decoded[6]&7);
+        break;
+
+      case PixMobNOVA::CMD_SET_REPEAT_COUNT:
+        repeatCount=uint8_t(p.decoded[5]|((p.decoded[6]&3)<<6));
+        break;
+
+      case PixMobNOVA::CMD_SET_GST:
+        gstMs=PixMobNOVA::gstCodeMs((p.decoded[4]>>2)&7);
+        break;
+
+      case PixMobNOVA::CMD_RESET:
+        effect.running=false; setMain({0,0,0}); break;
+
+      default:
+        // Valid but not confidently renderable: do nothing.
+        break;
     }
-  
+  }
 
-#ifndef WLED_DISABLE_MQTT
-    /**
-     * onMqttMessage() is called when a subscribed MQTT topic receives a message.
-     * topic only contains stripped topic (part after /wled/MAC).
-     * Return true to mark the message handled (prevents other usermods from seeing it).
-     * These methods must be inside a #ifndef WLED_DISABLE_MQTT guard — MQTT support is a compile-time option.
-     * See usermods/multi_relay for a well-structured subscribe-in-connect / handle-in-message example.
-     */
-    bool onMqttMessage(char* topic, char* payload) override {
-      //if (strlen(topic) == 8 && strncmp_P(topic, PSTR("/command"), 8) == 0) {
-      //  String action = payload;
-      //  if (action == "on")     { enabled = true;  return true; }
-      //  if (action == "off")    { enabled = false; return true; }
-      //  if (action == "toggle") { enabled = !enabled; return true; }
-      //}
-      return false;
-    }
+  void render() {
+    if(!effect.running) return;
 
-    /**
-     * onMqttConnect() is called when MQTT connection is established.
-     * Subscribe to topics here; mqttDeviceTopic holds the device-specific prefix.
-     */
-    void onMqttConnect(bool sessionPresent) override {
-      //char subuf[64];
-      //if (mqttDeviceTopic[0] != 0) {
-      //  strcpy(subuf, mqttDeviceTopic);
-      //  strcat_P(subuf, PSTR("/command"));
-      //  mqtt->subscribe(subuf, 0);
-      //}
-    }
-#endif
+    uint32_t now=millis();
+    uint32_t t=now-effect.startMs;
 
+    if(t<effect.delay) return;
+    t-=effect.delay;
 
-    /**
-     * onStateChanged() is used to detect WLED state change
-     * @mode parameter is CALL_MODE_... parameter used for notifications
-     */
-    void onStateChange(uint8_t mode) override {
-      // do something if WLED state changed (color, brightness, effect, preset, etc)
+    if(effect.two) {
+      if(t<effect.sustain) setMain(effect.a);
+      else if(t<uint32_t(effect.sustain)*2) setMain(effect.b);
+      else finish();
+      return;
     }
 
+    uint32_t total=uint32_t(effect.attack)+effect.sustain+effect.release;
 
-    /*
-     * getId() allows you to optionally give your usermod a unique ID.
-     * The base class returns USERMOD_ID_UNSPECIFIED, which is correct for most custom usermods.
-     * Override only if you need reliable cross-usermod lookup via UsermodManager::lookup()
-     * and have multiple usermods with the same ID registered simultaneously.
-     */
-    // uint16_t getId() override { return USERMOD_ID_UNSPECIFIED; }
+    if(t<effect.attack) {
+      float f=effect.attack?float(t)/effect.attack:1.0f;
+      setMain({
+        uint8_t(effect.a.r*f),uint8_t(effect.a.g*f),uint8_t(effect.a.b*f)
+      });
+    } else if(t<uint32_t(effect.attack)+effect.sustain) {
+      setMain(effect.a);
+    } else if(t<total) {
+      uint32_t rt=t-effect.attack-effect.sustain;
+      float f=effect.release?1.0f-float(rt)/effect.release:0.0f;
+      setMain({
+        uint8_t(effect.a.r*max(0.0f,f)),
+        uint8_t(effect.a.g*max(0.0f,f)),
+        uint8_t(effect.a.b*max(0.0f,f))
+      });
+    } else finish();
+  }
 
-   //More methods can be added in the future, this example will then be extended.
-   //Your usermod will remain compatible as it does not need to implement all methods from the Usermod base class!
+  void finish() {
+    if(effect.repeats) {
+      --effect.repeats;
+      effect.startMs=millis();
+      return;
+    }
+    effect.running=false;
+    setMain({0,0,0});
+  }
+
+  const char *modeName() const {
+    return mode==NOVA?"nova":mode==WLED?"wled":"auto";
+  }
+
+public:
+  void setup() override {
+    self=this;
+    pinMode(irPin,INPUT);
+    lastEdgeUs=micros();
+    attachInterrupt(digitalPinToInterrupt(irPin),isr,CHANGE);
+    initialized=true;
+  }
+
+  void loop() override {
+    if(!enabled || !initialized) return;
+
+    consume();
+
+    if(mode==WLED) {
+      active=false;
+      effect.running=false;
+      return;
+    }
+
+    render();
+
+    if(mode==AUTO && active && millis()-lastPacketMs>timeoutMs) {
+      active=false;
+      effect.running=false;
+    }
+
+    if(overflow) {
+      noInterrupts();
+      overflow=false;
+      tail=head;
+      interrupts();
+      resetFrame();
+    }
+  }
+
+  void addToJsonInfo(JsonObject &root) override {
+    JsonObject u=root["u"];
+    if(u.isNull()) u=root.createNestedObject("u");
+    JsonObject n=u.createNestedObject("PixMob NOVA");
+    n["target_fw"]="0x05";
+    n["ir_pin"]=irPin;
+    n["mode"]=modeName();
+    n["active"]=active;
+    n["last_packet_ms"]=lastPacketMs;
+  }
+
+  void addToJsonState(JsonObject &root) override {
+    if(!initialized) return;
+    JsonObject n=root["PixMob NOVA"];
+    if(n.isNull()) n=root.createNestedObject("PixMob NOVA");
+    n["mode"]=modeName();
+    n["active"]=active;
+    n["timeout_ms"]=timeoutMs;
+    n["group_sel"]=groupSel;
+    n["repeat_count"]=repeatCount;
+    n["repeat_delay_ms"]=repeatDelayMs;
+    n["gst_ms"]=gstMs;
+  }
+
+  void readFromJsonState(JsonObject &root) override {
+    JsonObject n=root["PixMob NOVA"];
+    if(n.isNull()) return;
+    String m=n["mode"]|modeName();
+    mode=(m=="nova")?NOVA:(m=="wled")?WLED:AUTO;
+    timeoutMs=n["timeout_ms"]|timeoutMs;
+    timeoutMs=constrain(timeoutMs,250UL,30000UL);
+  }
+
+  void addToConfig(JsonObject &root) override {
+    JsonObject n=root.createNestedObject("PixMob NOVA");
+    n["enabled"]=enabled;
+    n["ir_pin"]=irPin;
+    n["timeout_ms"]=timeoutMs;
+    n["mode"]=modeName();
+    n["group_sel"]=groupSel;
+    n["repeat_count"]=repeatCount;
+    n["repeat_delay_ms"]=repeatDelayMs;
+    n["gst_ms"]=gstMs;
+    JsonArray ids=n.createNestedArray("group_ids");
+    for(uint8_t i=0;i<8;i++) ids.add(groupIds[i]);
+  }
+
+  bool readFromConfig(JsonObject &root) override {
+    JsonObject n=root["PixMob NOVA"];
+    if(n.isNull()) return false;
+
+    enabled=n["enabled"]|enabled;
+    irPin=n["ir_pin"]|irPin;
+    timeoutMs=n["timeout_ms"]|timeoutMs;
+
+    String m=n["mode"]|"auto";
+    mode=(m=="nova")?NOVA:(m=="wled")?WLED:AUTO;
+
+    groupSel=n["group_sel"]|groupSel;
+    repeatCount=n["repeat_count"]|repeatCount;
+    repeatDelayMs=n["repeat_delay_ms"]|repeatDelayMs;
+    gstMs=n["gst_ms"]|gstMs;
+
+    JsonArray ids=n["group_ids"].as<JsonArray>();
+    if(!ids.isNull())
+      for(uint8_t i=0;i<8 && i<ids.size();i++) groupIds[i]=ids[i];
+
+    return true;
+  }
+
+  void appendConfigData() override {}
 };
 
-
-// add more strings here to reduce flash memory usage
-const char MyExampleUsermod::_name[]    PROGMEM = "ExampleUsermod";
-const char MyExampleUsermod::_enabled[] PROGMEM = "enabled";
-
-
-// implementation of non-inline member methods
-
-void MyExampleUsermod::publishMqtt(const char* state, bool retain)
-{
-#ifndef WLED_DISABLE_MQTT
-  //Check if MQTT Connected, otherwise it will crash the 8266
-  if (WLED_MQTT_CONNECTED) {
-    char subuf[64];
-    strcpy(subuf, mqttDeviceTopic);
-    strcat_P(subuf, PSTR("/example"));
-    mqtt->publish(subuf, 0, retain, state);
-  }
-#endif
-}
-
-static MyExampleUsermod example_usermod;
-REGISTER_USERMOD(example_usermod);
+PixMobNovaEventReceiver *PixMobNovaEventReceiver::self=nullptr;
+static PixMobNovaEventReceiver pixMobNovaEventReceiver;
+REGISTER_USERMOD(pixMobNovaEventReceiver);
